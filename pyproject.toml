@@ -1,0 +1,25 @@
+[project]
+name = "frontlet"
+version = "0.1.0"
+description = "Minimal Front MCP server for AI agents — list conversations, read messages/comments, download attachments."
+readme = "README.md"
+authors = [
+    { name = "Nemanja Čorlija", email = "chorlya@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp>=1.27.0",
+]
+license = "MIT"
+
+[project.urls]
+Homepage = "https://github.com/nnc/frontlet"
+Issues = "https://github.com/nnc/frontlet/issues"
+
+[project.scripts]
+frontlet = "frontlet.server:main"
+
+[build-system]
+requires = ["uv_build>=0.9.8,<0.10.0"]
+build-backend = "uv_build"

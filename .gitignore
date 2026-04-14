@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# uv
+.uv/
+# Note: uv.lock is intentionally committed for reproducible `uvx` installs.
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Build
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Local
+.env
+.env.local
