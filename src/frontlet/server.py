@@ -1,8 +1,10 @@
 """Frontlet: a minimal Front MCP server.
 
-Exposes four tools over stdio so an AI agent can:
+Exposes five tools over stdio so an AI agent can:
   - list conversations (with Front's search syntax for filtering)
-  - fetch a conversation with its messages and internal comments
+  - fetch one conversation's metadata (subject, status, tags, last message)
+  - page through the messages on a conversation (newest-first by default)
+  - page through internal teammate comments on a conversation
   - list all workspace tags (for query-building)
   - download an attachment to a local temp path
 
@@ -11,7 +13,6 @@ Auth: reads FRONT_API_TOKEN from the environment at startup.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 import sys
@@ -29,7 +30,7 @@ MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB
 API_TOKEN = os.environ.get("FRONT_API_TOKEN")
 if not API_TOKEN:
     print(
-        "frontlet-mcp: FRONT_API_TOKEN environment variable is required.\n"
+        "frontlet: FRONT_API_TOKEN environment variable is required.\n"
         "Get a token from Front Settings -> Company -> Developers -> API tokens, "
         "then set it in your MCP client config (e.g. Claude Desktop's 'env' block).",
         file=sys.stderr,
@@ -144,31 +145,81 @@ async def list_conversations(
 
 @mcp.tool()
 async def get_conversation(conversation_id: str) -> dict[str, Any]:
-    """Fetch a conversation with all its messages and internal comments.
+    """Fetch one conversation's metadata (no message bodies).
 
-    Returns the conversation metadata, external messages (emails, chats,
-    replies), and internal teammate comments in a single response. Messages
-    and comments are separate arrays; use their `created_at` timestamps to
-    interleave them chronologically if needed.
+    Returns subject, status, assignee, tags, recipients, timestamps, and a
+    short preview of the last message (id, author, snippet, created_at).
+    Cheap call — use this to decide whether to dig in.
 
-    Attachment metadata (id, filename, size, content_type) is available on
-    each message under `attachments`. Use `download_attachment(attachment_id)`
-    to fetch the file bytes to local disk.
+    Then call `list_conversation_messages(conversation_id)` for the actual
+    message bodies, and `list_conversation_comments(conversation_id)` for
+    internal teammate comments. Both paginate, so long threads stay cheap.
     """
     _assert_id(conversation_id, "conversation_id")
-    http = _http()
-    conv_task = http.get(f"/conversations/{conversation_id}")
-    msgs_task = http.get(f"/conversations/{conversation_id}/messages")
-    cmts_task = http.get(f"/conversations/{conversation_id}/comments")
+    r = await _http().get(f"/conversations/{conversation_id}")
+    r.raise_for_status()
+    return _trim_conversation_detail(r.json())
 
-    conv_r, msgs_r, cmts_r = await asyncio.gather(conv_task, msgs_task, cmts_task)
-    for r in (conv_r, msgs_r, cmts_r):
-        r.raise_for_status()
 
+@mcp.tool()
+async def list_conversation_messages(
+    conversation_id: str,
+    limit: int = 5,
+    page_token: str | None = None,
+    sort_order: str = "desc",
+) -> dict[str, Any]:
+    """List the messages on a conversation (full bodies).
+
+    Defaults to the 5 most recent messages (`sort_order="desc"`). Pass
+    `sort_order="asc"` to read oldest-first. Use `page_token` from the
+    previous response's `next_page_token` to continue.
+
+    Each message includes body/text/html, author, recipients, attachments
+    metadata, and timestamps. Use `download_attachment(attachment_id)` to
+    pull a file's bytes to local disk.
+    """
+    _assert_id(conversation_id, "conversation_id")
+    if sort_order not in ("asc", "desc"):
+        raise ValueError(f"sort_order must be 'asc' or 'desc', got {sort_order!r}")
+    limit = max(1, min(limit, 100))
+    params: dict[str, Any] = {"limit": limit, "sort_order": sort_order}
+    if page_token:
+        params["page_token"] = page_token
+
+    r = await _http().get(f"/conversations/{conversation_id}/messages", params=params)
+    r.raise_for_status()
+    data = r.json()
     return {
-        "conversation": conv_r.json(),
-        "messages": msgs_r.json().get("_results", []),
-        "comments": cmts_r.json().get("_results", []),
+        "messages": data.get("_results", []),
+        "next_page_token": (data.get("_pagination") or {}).get("next"),
+    }
+
+
+@mcp.tool()
+async def list_conversation_comments(
+    conversation_id: str,
+    limit: int = 20,
+    page_token: str | None = None,
+) -> dict[str, Any]:
+    """List internal teammate comments on a conversation.
+
+    Comments are private notes between teammates — they're not sent to the
+    customer. Returns full comment bodies (`body`), author, attachments
+    metadata, and timestamps. Use `page_token` from the previous response's
+    `next_page_token` to continue.
+    """
+    _assert_id(conversation_id, "conversation_id")
+    limit = max(1, min(limit, 100))
+    params: dict[str, Any] = {"limit": limit}
+    if page_token:
+        params["page_token"] = page_token
+
+    r = await _http().get(f"/conversations/{conversation_id}/comments", params=params)
+    r.raise_for_status()
+    data = r.json()
+    return {
+        "comments": data.get("_results", []),
+        "next_page_token": (data.get("_pagination") or {}).get("next"),
     }
 
 
@@ -216,7 +267,7 @@ async def download_attachment(
     """Download a Front attachment to local disk.
 
     Saves under the system temp directory at
-    `<tmpdir>/frontlet-mcp/<attachment_id>/<sanitized_filename>`. The path
+    `<tmpdir>/frontlet/<attachment_id>/<sanitized_filename>`. The path
     is returned in the response and is stable across repeated calls for the
     same attachment_id (so re-invocations just overwrite).
 
@@ -284,6 +335,36 @@ def _trim_conversation(c: dict[str, Any]) -> dict[str, Any]:
         "tags": [t.get("name") for t in (c.get("tags") or [])],
         "last_message_at": (last_msg or {}).get("created_at"),
         "created_at": c.get("created_at"),
+    }
+
+
+def _trim_conversation_detail(c: dict[str, Any]) -> dict[str, Any]:
+    """Single-conversation view: summary plus a preview of the last message."""
+    last_msg = c.get("last_message") if isinstance(c.get("last_message"), dict) else None
+    last_preview: dict[str, Any] | None = None
+    if last_msg:
+        author = last_msg.get("author") or {}
+        last_preview = {
+            "id": last_msg.get("id"),
+            "type": last_msg.get("type"),
+            "is_inbound": last_msg.get("is_inbound"),
+            "created_at": last_msg.get("created_at"),
+            "blurb": last_msg.get("blurb"),
+            "author": author.get("email") or author.get("username"),
+        }
+    return {
+        "id": c.get("id"),
+        "subject": c.get("subject"),
+        "status": c.get("status"),
+        "is_private": c.get("is_private"),
+        "assignee": (c.get("assignee") or {}).get("email") if c.get("assignee") else None,
+        "tags": [t.get("name") for t in (c.get("tags") or [])],
+        "recipients": [
+            {"handle": r.get("handle"), "role": r.get("role")}
+            for r in (c.get("recipients") or [])
+        ],
+        "created_at": c.get("created_at"),
+        "last_message": last_preview,
     }
 
 

@@ -2,14 +2,16 @@
 
 A minimal [Model Context Protocol](https://modelcontextprotocol.io) server for [Front](https://front.com), designed for AI agents that need to read conversations and pull down attachments. No Docker, no build step, no clone — install with a single `uvx` command.
 
-Four tools. ~1,250 tokens in your context window.
+Six tools. Small context footprint.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
 | `list_conversations` | Most recent conversations, or filter by Front search syntax (tags, status, assignee, dates, etc.) |
-| `get_conversation` | One conversation with all its external messages and internal team comments |
+| `get_conversation` | One conversation's metadata (subject, status, tags, last-message preview) — no message bodies |
+| `list_conversation_messages` | Page through messages on a conversation (defaults to 5 most recent, newest-first) |
+| `list_conversation_comments` | Page through internal teammate comments on a conversation (defaults to 20) |
 | `list_tags` | Discover which tags exist before building queries |
 | `download_attachment` | Save an attachment to `$TMPDIR/frontlet/<id>/<filename>`; up to 10 MB |
 
