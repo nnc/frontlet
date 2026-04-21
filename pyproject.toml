@@ -1,7 +1,7 @@
 [project]
 name = "frontlet"
-version = "0.1.0"
-description = "Minimal Front MCP server for AI agents — list conversations, read messages/comments, download attachments."
+version = "0.3.0"
+description = "Minimal Front MCP server for AI agents — read conversations, compose draft replies, download attachments."
 readme = "README.md"
 authors = [
     { name = "Nemanja Čorlija", email = "chorlya@gmail.com" }

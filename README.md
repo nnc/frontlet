@@ -1,8 +1,8 @@
 # frontlet
 
-A minimal [Model Context Protocol](https://modelcontextprotocol.io) server for [Front](https://front.com), designed for AI agents that need to read conversations and pull down attachments. No Docker, no build step, no clone — install with a single `uvx` command.
+A minimal [Model Context Protocol](https://modelcontextprotocol.io) server for [Front](https://front.com), designed for AI agents that need to read conversations, compose draft replies, and pull down attachments. No Docker, no build step, no clone — install with a single `uvx` command.
 
-Six tools. Small context footprint.
+Nine tools. Small context footprint.
 
 ## Tools
 
@@ -14,6 +14,9 @@ Six tools. Small context footprint.
 | `list_conversation_comments` | Page through internal teammate comments on a conversation (defaults to 20) |
 | `list_tags` | Discover which tags exist before building queries |
 | `download_attachment` | Save an attachment to `$TMPDIR/frontlet/<id>/<filename>`; up to 10 MB |
+| `create_draft` | Create a new draft message (starts a new conversation) for human review |
+| `create_draft_reply` | Create a reply draft on an existing conversation — auto-populates Reply All recipients |
+| `edit_draft` | Update an existing draft's body, recipients, or subject (optimistic locking via `version`) |
 
 ## Install
 
@@ -22,7 +25,10 @@ You need [`uv`](https://docs.astral.sh/uv/) on your machine.
 ### Claude Code
 
 ```bash
-claude mcp add frontlet -e FRONT_API_TOKEN=eyJ... -- uvx --from git+https://github.com/nnc/frontlet frontlet
+claude mcp add frontlet \
+  -e FRONT_API_TOKEN=eyJ... \
+  -e FRONT_SENDING_CHANNEL_ID=alt:address:support@yourcompany.com \
+  -- uvx --from git+https://github.com/nnc/frontlet frontlet
 ```
 
 Verify it was added:
@@ -42,7 +48,8 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` on macO
       "command": "uvx",
       "args": ["--from", "git+https://github.com/nnc/frontlet", "frontlet"],
       "env": {
-        "FRONT_API_TOKEN": "eyJ..."
+        "FRONT_API_TOKEN": "eyJ...",
+        "FRONT_SENDING_CHANNEL_ID": "alt:address:support@yourcompany.com"
       }
     }
   }
@@ -51,7 +58,13 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` on macO
 
 ### Getting your Front API token
 
-Front Settings → Company → Developers → API tokens → create a token with the scopes you need (at a minimum `shared:*` with `Read` permissions for attachments, comments, conversations, messages and tags). Front tokens are JWTs — they start with `eyJ` and are quite long.
+Front Settings → Company → Developers → API tokens → create a token with the scopes you need:
+
+- **Read** permissions for attachments, comments, conversations, messages, and tags (at a minimum `shared:*` with `Read`).
+- **Write** permission to create and edit drafts (`drafts:write` scope).
+- **Do NOT grant Send permission** — this keeps agents from sending messages directly. Agents create drafts; humans review and send.
+
+Front tokens are JWTs — they start with `eyJ` and are quite long.
 
 ## Usage notes
 
@@ -66,6 +79,48 @@ Front Settings → Company → Developers → API tokens → create a token with
 - `(tag:billing OR tag:refund) status:open` — grouped filter
 
 Full reference: [dev.frontapp.com/reference/search](https://dev.frontapp.com/reference/search). The tool description also embeds a large cheat-sheet so the LLM can build queries without external lookups.
+
+### Drafts
+
+Agents create drafts for human review — they never send messages directly. A teammate must open the draft in Front and click Send.
+
+#### Sending channel (`FRONT_SENDING_CHANNEL_ID`)
+
+This is the email address (or channel) that drafts will be sent **from** — the outgoing address, not the recipient. Set it as an environment variable so agents don't need to specify it on every call.
+
+**How to find your channel address:** Front Settings → Inboxes → pick the inbox → the channel address is the email address shown (e.g. `support@yourcompany.com`).
+
+**Format:** use the `alt:address:` prefix followed by the email address:
+
+```
+FRONT_SENDING_CHANNEL_ID=alt:address:support@yourcompany.com
+FRONT_SENDING_CHANNEL_ID=alt:address:billing@yourcompany.com
+```
+
+A raw Front channel ID like `cha_abc123` also works, but the `alt:address:` format is easier to remember.
+
+Any draft tool can override this per-call via the `channel_id` parameter.
+
+#### Reply All
+
+`create_draft_reply` automatically populates recipients from the conversation's last message, emulating the Reply All button. All original TO and FROM addresses go into `to`, all original CC addresses go into `cc`, and the sending channel's own address is excluded. Pass `to` or `cc` explicitly to override the auto-detected recipients.
+
+#### Rich formatting
+
+The `body` parameter on all draft tools accepts HTML:
+
+```html
+<strong>bold</strong>, <em>italic</em>
+<a href="https://example.com">links</a>
+<ul><li>unordered list</li></ul>
+<ol><li>ordered list</li></ol>
+<p>paragraphs</p>, <br> line breaks
+<blockquote>quoted text</blockquote>
+```
+
+#### Editing drafts
+
+`edit_draft` requires the `version` string returned by `create_draft`, `create_draft_reply`, or a previous `edit_draft` call. This prevents accidental overwrites when the draft was modified elsewhere — if the version is stale, Front rejects the edit.
 
 ### Attachment storage
 
@@ -102,7 +157,8 @@ claude mcp add frontlet -e FRONT_API_TOKEN=eyJ... -- uv run --directory /absolut
 
 Intentionally left out:
 
-- **Attachment upload / message sending** — read-only by design.
+- **Message sending** — agents create drafts for human review, never send directly.
+- **Attachment upload** — drafts are text-only for now.
 - **Webhooks** — separate runtime model.
 - **Streaming large files** — 10 MB cap keeps the implementation simple.
 - **Caching** — the agent manages its own context; the server is stateless per call.
