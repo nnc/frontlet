@@ -8,10 +8,10 @@ Exposes tools over stdio so an AI agent can:
   - list all workspace tags (for query-building)
   - download an attachment to a local temp path
   - create and edit draft messages for human review
+  - add and remove tags on conversations
 
 Auth: reads FRONT_API_TOKEN from the environment at startup.
-Optional: FRONT_SENDING_CHANNEL_ID — the default channel for draft creation
-(e.g. alt:address:support@yourcompany.com).
+Sending channel and draft author are auto-detected from the workspace.
 """
 
 from __future__ import annotations
@@ -29,8 +29,6 @@ from mcp.server.fastmcp import FastMCP
 
 FRONT_API_BASE = "https://api2.frontapp.com"
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB
-
-SENDING_CHANNEL_ID = os.environ.get("FRONT_SENDING_CHANNEL_ID")
 
 API_TOKEN = os.environ.get("FRONT_API_TOKEN")
 if not API_TOKEN:
@@ -57,6 +55,97 @@ def _http() -> httpx.AsyncClient:
             timeout=httpx.Timeout(30.0, connect=10.0),
         )
     return _client
+
+
+_cached_channels: list[dict[str, Any]] | None = None
+_cached_teammates: list[dict[str, Any]] | None = None
+
+
+async def _get_channels() -> list[dict[str, Any]]:
+    global _cached_channels
+    if _cached_channels is None:
+        try:
+            r = await _http().get("/channels")
+            r.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise ValueError(
+                "Failed to fetch channels (ensure your API token has the "
+                f"'channels:read' scope): {exc.response.status_code}"
+            ) from exc
+        _cached_channels = r.json().get("_results", [])
+    return _cached_channels
+
+
+async def _get_teammates() -> list[dict[str, Any]]:
+    global _cached_teammates
+    if _cached_teammates is None:
+        try:
+            r = await _http().get("/teammates")
+            r.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise ValueError(
+                "Failed to fetch teammates (ensure your API token has the "
+                f"'teammates:read' scope): {exc.response.status_code}"
+            ) from exc
+        _cached_teammates = r.json().get("_results", [])
+    return _cached_teammates
+
+
+async def _resolve_channel_id(override: str | None) -> str:
+    if override:
+        return override
+    channels = await _get_channels()
+    if not channels:
+        raise ValueError(
+            "No channels found in this workspace. "
+            "Pass channel_id explicitly."
+        )
+    if len(channels) == 1:
+        return channels[0]["id"]
+    options = "\n".join(
+        f"  - {ch.get('address', '?')} (id: {ch['id']})"
+        for ch in channels
+    )
+    raise ValueError(
+        f"Multiple channels found — pass channel_id to select one:\n{options}"
+    )
+
+
+async def _resolve_author_id(
+    override: str | None, require: bool
+) -> str | None:
+    if override:
+        if override.startswith("tea_"):
+            return override
+        teammates = await _get_teammates()
+        for t in teammates:
+            if t.get("email", "").lower() == override.lower():
+                return t["id"]
+        raise ValueError(
+            f"No teammate found with email {override!r}. "
+            "Pass a teammate ID (tea_xxx) or a valid teammate email."
+        )
+    teammates = await _get_teammates()
+    humans = [t for t in teammates if t.get("type") == "user"]
+    if not humans:
+        if require:
+            raise ValueError(
+                "No human teammates found. Pass author_id explicitly "
+                "for private drafts."
+            )
+        return None
+    if len(humans) == 1:
+        return humans[0]["id"]
+    if require:
+        options = "\n".join(
+            f"  - {t.get('email', '?')} (id: {t['id']})"
+            for t in humans
+        )
+        raise ValueError(
+            "Multiple teammates found — pass author_id to select one "
+            f"(required for private drafts):\n{options}"
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +413,7 @@ async def create_draft(
     bcc: list[str] | None = None,
     subject: str | None = None,
     channel_id: str | None = None,
+    author_id: str | None = None,
     mode: str = "shared",
 ) -> dict[str, Any]:
     """Create a new draft message, starting a new conversation.
@@ -339,14 +429,27 @@ async def create_draft(
       <ul>/<ol> with <li> for lists, <p> for paragraphs, <br> for line
       breaks, <blockquote> for quotes.
 
-    The sending channel defaults to the FRONT_SENDING_CHANNEL_ID environment
-    variable. Pass `channel_id` to override (e.g. "alt:address:other@co.com").
+    The sending channel is auto-detected if the workspace has one channel.
+    Pass `channel_id` to override (e.g. "alt:address:other@co.com").
+
+    The draft author is auto-detected if the workspace has one human
+    teammate. Pass `author_id` (teammate ID or email) to override.
+    Required for private drafts if multiple teammates exist.
     """
     if mode not in ("shared", "private"):
         raise ValueError(f"mode must be 'shared' or 'private', got {mode!r}")
-    resolved_channel = _resolve_channel_id(channel_id)
+    resolved_channel = await _resolve_channel_id(channel_id)
+    resolved_author = await _resolve_author_id(
+        author_id, require=(mode == "private")
+    )
 
-    payload: dict[str, Any] = {"body": body, "mode": mode}
+    payload: dict[str, Any] = {
+        "body": body,
+        "mode": mode,
+        "should_add_default_signature": True,
+    }
+    if resolved_author:
+        payload["author_id"] = resolved_author
     if to:
         payload["to"] = to
     if cc:
@@ -370,6 +473,8 @@ async def create_draft_reply(
     bcc: list[str] | None = None,
     subject: str | None = None,
     channel_id: str | None = None,
+    author_id: str | None = None,
+    message_id: str | None = None,
     mode: str = "shared",
 ) -> dict[str, Any]:
     """Create a reply draft on an existing conversation (Reply All).
@@ -383,33 +488,50 @@ async def create_draft_reply(
     address is excluded. Pass `to` or `cc` explicitly to override the
     auto-detected recipients.
 
+    Pass `message_id` to reply to a specific message instead of the most
+    recent one. The quoted reply and recipients will come from that message.
+
     The `body` accepts HTML for rich formatting:
       <strong>bold</strong>, <em>italic</em>, <a href="...">links</a>,
       <ul>/<ol> with <li> for lists, <p> for paragraphs, <br> for line
       breaks, <blockquote> for quotes.
 
-    The sending channel defaults to the FRONT_SENDING_CHANNEL_ID environment
-    variable. Pass `channel_id` to override.
+    The reply automatically includes the original message as a quoted reply
+    and appends the account's default email signature.
+
+    The sending channel is auto-detected if the workspace has one channel.
+    Pass `channel_id` to override.
+
+    The draft author is auto-detected if the workspace has one human
+    teammate. Pass `author_id` (teammate ID or email) to override.
+    Required for private drafts if multiple teammates exist.
     """
     _assert_id(conversation_id, "conversation_id")
+    if message_id:
+        _assert_id(message_id, "message_id")
     if mode not in ("shared", "private"):
         raise ValueError(f"mode must be 'shared' or 'private', got {mode!r}")
-    resolved_channel = _resolve_channel_id(channel_id)
+    resolved_channel = await _resolve_channel_id(channel_id)
+    resolved_author = await _resolve_author_id(
+        author_id, require=(mode == "private")
+    )
 
-    if to is None or cc is None:
-        auto_to, auto_cc = await _reply_all_recipients(
-            conversation_id, resolved_channel
-        )
-        if to is None:
-            to = auto_to
-        if cc is None:
-            cc = auto_cc
+    ctx = await _fetch_reply_context(conversation_id, resolved_channel, message_id)
+    if to is None:
+        to = ctx["to"]
+    if cc is None:
+        cc = ctx["cc"]
 
     payload: dict[str, Any] = {
         "body": body,
         "channel_id": resolved_channel,
         "mode": mode,
+        "should_add_default_signature": True,
     }
+    if resolved_author:
+        payload["author_id"] = resolved_author
+    if ctx["body"]:
+        payload["quote_body"] = ctx["body"]
     if to:
         payload["to"] = to
     if cc:
@@ -441,16 +563,19 @@ async def edit_draft(
 
     Requires the `version` string returned by `create_draft`,
     `create_draft_reply`, or a previous `edit_draft` call. If the draft was
-    modified elsewhere since that version, Front rejects the edit — re-read
-    the draft to get the current version and retry.
+    modified elsewhere since that version, Front rejects the edit with a
+    version mismatch error. This commonly happens when a teammate opens the
+    draft in Front — just viewing it can bump the version. To recover, call
+    `list_conversation_messages` on the conversation to find the draft
+    message, use its `version` field, and retry.
 
     The `body` accepts the same HTML formatting as the create tools.
 
-    The sending channel defaults to the FRONT_SENDING_CHANNEL_ID environment
-    variable. Pass `channel_id` to override.
+    The sending channel is auto-detected if the workspace has one channel.
+    Pass `channel_id` to override.
     """
     _assert_id(draft_id, "draft_id")
-    resolved_channel = _resolve_channel_id(channel_id)
+    resolved_channel = await _resolve_channel_id(channel_id)
 
     payload: dict[str, Any] = {
         "body": body,
@@ -471,45 +596,86 @@ async def edit_draft(
     return _trim_draft(r.json())
 
 
+@mcp.tool()
+async def tag_conversation(
+    conversation_id: str,
+    tag_ids: list[str],
+) -> dict[str, Any]:
+    """Add tags to a conversation.
+
+    Accepts one or more tag IDs. Call `list_tags` first to discover
+    available tags and their IDs.
+    """
+    _assert_id(conversation_id, "conversation_id")
+    for tid in tag_ids:
+        _assert_id(tid, "tag_ids[]")
+    r = await _http().post(
+        f"/conversations/{conversation_id}/tags",
+        json={"tag_ids": tag_ids},
+    )
+    r.raise_for_status()
+    return {"status": "ok", "tagged": tag_ids}
+
+
+@mcp.tool()
+async def untag_conversation(
+    conversation_id: str,
+    tag_ids: list[str],
+) -> dict[str, Any]:
+    """Remove tags from a conversation.
+
+    Accepts one or more tag IDs. Call `list_tags` first to discover
+    available tags and their IDs.
+    """
+    _assert_id(conversation_id, "conversation_id")
+    for tid in tag_ids:
+        _assert_id(tid, "tag_ids[]")
+    r = await _http().request(
+        "DELETE",
+        f"/conversations/{conversation_id}/tags",
+        json={"tag_ids": tag_ids},
+    )
+    r.raise_for_status()
+    return {"status": "ok", "untagged": tag_ids}
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _resolve_channel_id(override: str | None) -> str:
-    """Return the effective channel ID: explicit override > env var > error."""
-    value = override or SENDING_CHANNEL_ID
-    if not value:
-        raise ValueError(
-            "No sending channel configured. Set the FRONT_SENDING_CHANNEL_ID "
-            "environment variable (e.g. alt:address:support@yourcompany.com) "
-            "or pass channel_id explicitly."
-        )
-    return value
+async def _fetch_reply_context(
+    conversation_id: str,
+    channel_id: str,
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    """Fetch the message to reply to and extract recipients + body.
 
-
-async def _reply_all_recipients(
-    conversation_id: str, channel_id: str
-) -> tuple[list[str], list[str]]:
-    """Derive Reply All recipients from the conversation's last message.
-
-    Returns (to_list, cc_list).  The sending channel's own address is
-    excluded so it doesn't appear as a recipient on the draft.
+    If message_id is given, fetches that specific message. Otherwise fetches
+    the conversation's most recent message. Returns a dict with keys:
+    to, cc (recipient lists) and body (HTML for quote_body).
     """
-    r = await _http().get(
-        f"/conversations/{conversation_id}/messages",
-        params={"limit": 1, "sort_order": "desc"},
-    )
+    if message_id:
+        r = await _http().get(f"/messages/{message_id}")
+    else:
+        r = await _http().get(
+            f"/conversations/{conversation_id}/messages",
+            params={"limit": 1, "sort_order": "desc"},
+        )
     r.raise_for_status()
-    messages = r.json().get("_results", [])
-    if not messages:
-        return [], []
+
+    if message_id:
+        msg = r.json()
+    else:
+        messages = r.json().get("_results", [])
+        if not messages:
+            return {"to": [], "cc": [], "body": ""}
+        msg = messages[0]
 
     exclude = _channel_address(channel_id)
-    last = messages[0]
     to_handles: list[str] = []
     cc_handles: list[str] = []
-    for recipient in last.get("recipients") or []:
+    for recipient in msg.get("recipients") or []:
         handle = recipient.get("handle")
         if not handle or (exclude and handle.lower() == exclude.lower()):
             continue
@@ -518,7 +684,11 @@ async def _reply_all_recipients(
             to_handles.append(handle)
         elif role == "cc":
             cc_handles.append(handle)
-    return to_handles, cc_handles
+    return {
+        "to": to_handles,
+        "cc": cc_handles,
+        "body": msg.get("body", ""),
+    }
 
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")

@@ -2,7 +2,7 @@
 
 A minimal [Model Context Protocol](https://modelcontextprotocol.io) server for [Front](https://front.com), designed for AI agents that need to read conversations, compose draft replies, and pull down attachments. No Docker, no build step, no clone — install with a single `uvx` command.
 
-Nine tools. Small context footprint.
+Eleven tools. Small context footprint.
 
 ## Tools
 
@@ -15,8 +15,10 @@ Nine tools. Small context footprint.
 | `list_tags` | Discover which tags exist before building queries |
 | `download_attachment` | Save an attachment to `$TMPDIR/frontlet/<id>/<filename>`; up to 10 MB |
 | `create_draft` | Create a new draft message (starts a new conversation) for human review |
-| `create_draft_reply` | Create a reply draft on an existing conversation — auto-populates Reply All recipients |
+| `create_draft_reply` | Create a reply draft on an existing conversation — Reply All with quoted message |
 | `edit_draft` | Update an existing draft's body, recipients, or subject (optimistic locking via `version`) |
+| `tag_conversation` | Add one or more tags to a conversation |
+| `untag_conversation` | Remove one or more tags from a conversation |
 
 ## Install
 
@@ -27,7 +29,6 @@ You need [`uv`](https://docs.astral.sh/uv/) on your machine.
 ```bash
 claude mcp add frontlet \
   -e FRONT_API_TOKEN=eyJ... \
-  -e FRONT_SENDING_CHANNEL_ID=alt:address:support@yourcompany.com \
   -- uvx --from git+https://github.com/nnc/frontlet frontlet
 ```
 
@@ -48,8 +49,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` on macO
       "command": "uvx",
       "args": ["--from", "git+https://github.com/nnc/frontlet", "frontlet"],
       "env": {
-        "FRONT_API_TOKEN": "eyJ...",
-        "FRONT_SENDING_CHANNEL_ID": "alt:address:support@yourcompany.com"
+        "FRONT_API_TOKEN": "eyJ..."
       }
     }
   }
@@ -58,11 +58,21 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` on macO
 
 ### Getting your Front API token
 
-Front Settings → Company → Developers → API tokens → create a token with the scopes you need:
+Front Settings → Company → Developers → API tokens → create a token with these scopes:
 
-- **Read** permissions for attachments, comments, conversations, messages, and tags (at a minimum `shared:*` with `Read`).
-- **Write** permission to create and edit drafts (`drafts:write` scope).
-- **Do NOT grant Send permission** — this keeps agents from sending messages directly. Agents create drafts; humans review and send.
+| Scope | What it enables |
+|---|---|
+| `conversations:read` | List and fetch conversations |
+| `messages:read` | Read message bodies and recipients |
+| `comments:read` | Read internal teammate comments |
+| `attachments:read` | Download attachments |
+| `tags:read` | List workspace tags |
+| `channels:read` | Auto-detect sending channel for drafts |
+| `teammates:read` | Auto-detect draft author |
+| `drafts:write` | Create and edit draft messages |
+| `conversations:write` | Add and remove tags on conversations |
+
+**Do NOT grant Send permission** — this keeps agents from sending messages directly. Agents create drafts; humans review and send.
 
 Front tokens are JWTs — they start with `eyJ` and are quite long.
 
@@ -84,26 +94,35 @@ Full reference: [dev.frontapp.com/reference/search](https://dev.frontapp.com/ref
 
 Agents create drafts for human review — they never send messages directly. A teammate must open the draft in Front and click Send.
 
-#### Sending channel (`FRONT_SENDING_CHANNEL_ID`)
+#### Sending channel
 
-This is the email address (or channel) that drafts will be sent **from** — the outgoing address, not the recipient. Set it as an environment variable so agents don't need to specify it on every call.
+The sending channel (the address drafts are sent **from**) is auto-detected from the workspace. If the workspace has exactly one channel, it's used automatically. If there are multiple channels, the agent must pass `channel_id` to specify which one — the error message lists all available channels with their addresses and IDs.
 
-**How to find your channel address:** Front Settings → Inboxes → pick the inbox → the channel address is the email address shown (e.g. `support@yourcompany.com`).
+Any draft tool can override auto-detection via the `channel_id` parameter (e.g. `alt:address:billing@yourcompany.com` or a raw channel ID like `cha_abc123`).
 
-**Format:** use the `alt:address:` prefix followed by the email address:
+#### Draft author
 
-```
-FRONT_SENDING_CHANNEL_ID=alt:address:support@yourcompany.com
-FRONT_SENDING_CHANNEL_ID=alt:address:billing@yourcompany.com
-```
+The draft author is auto-detected from the workspace's human teammates. If there's exactly one human teammate, they're set as the author automatically. If there are multiple, pass `author_id` (a teammate ID like `tea_abc` or the teammate's email address) to specify.
 
-A raw Front channel ID like `cha_abc123` also works, but the `alt:address:` format is easier to remember.
+For **private** drafts, `author_id` is required when multiple teammates exist — private drafts are only visible to their author, so the API bot identity won't work.
 
-Any draft tool can override this per-call via the `channel_id` parameter.
+For **shared** drafts, the author defaults to the API bot if multiple teammates exist and none is specified. The draft is still visible to everyone, but shows the bot as author rather than a human name.
 
 #### Reply All
 
-`create_draft_reply` automatically populates recipients from the conversation's last message, emulating the Reply All button. All original TO and FROM addresses go into `to`, all original CC addresses go into `cc`, and the sending channel's own address is excluded. Pass `to` or `cc` explicitly to override the auto-detected recipients.
+`create_draft_reply` automatically populates recipients from the conversation's last message (or from a specific message if `message_id` is provided), emulating the Reply All button. All original TO and FROM addresses go into `to`, all original CC addresses go into `cc`, and the sending channel's own address is excluded. Pass `to` or `cc` explicitly to override the auto-detected recipients.
+
+#### Quoted reply
+
+Reply drafts automatically include the original message body as a quoted reply, like a normal email client. Front wraps the quoted content as a blockquote. There is no opt-out — this matches standard email behavior.
+
+#### Replying to a specific message
+
+By default, `create_draft_reply` replies to the most recent message in the conversation. Pass `message_id` to reply to a specific message instead — the quoted reply and auto-detected recipients will come from that message.
+
+#### Signature
+
+All new drafts (`create_draft`, `create_draft_reply`) automatically include the account's default email signature. This is always on.
 
 #### Rich formatting
 
@@ -121,6 +140,12 @@ The `body` parameter on all draft tools accepts HTML:
 #### Editing drafts
 
 `edit_draft` requires the `version` string returned by `create_draft`, `create_draft_reply`, or a previous `edit_draft` call. This prevents accidental overwrites when the draft was modified elsewhere — if the version is stale, Front rejects the edit.
+
+### Tags
+
+Use `list_tags` to discover available tags, then `tag_conversation` and `untag_conversation` to modify them. Both tag tools accept a list of tag IDs, so multiple tags can be added or removed in one call.
+
+Workflow: `list_tags` → pick the IDs you need → `tag_conversation(conversation_id, tag_ids)`.
 
 ### Attachment storage
 
